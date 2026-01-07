@@ -1,6 +1,9 @@
 import { PlaywrightCrawler, log } from 'crawlee';
 import { getRedisStore, type DataRecord } from './redis-store.js';
 import { runBrowserlessScrape } from './browserless-crawler.js';
+import { normalizeTableData, type RawTableData } from './normalizer.js';
+import { detectChallengePage, validateRecords, meetsMinimumQuality } from './validator.js';
+import { generateRecordId } from './id-generator.js';
 
 export interface CrawlerConfig {
     category: string;
@@ -19,8 +22,24 @@ export interface CrawlerInstance {
 
 const DEFAULT_ROW_SELECTOR = '.datatable-v2_row__hkEus';
 const DEFAULT_POLL_INTERVAL = 30000;
-const MAX_RETRIES = 3;
-const RETRY_DELAY_BASE = 5000;
+
+// Environment-configurable parameters
+const MAX_RETRIES = parseInt(process.env.CRAWLER_MAX_RETRIES || '3', 10);
+const RETRY_DELAY_BASE_MS = parseInt(process.env.CRAWLER_RETRY_DELAY_BASE_MS || '5000', 10);
+const PLAYWRIGHT_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_TIMEOUT_MS || '30000', 10);
+const NO_DATA_BACKOFF_MS = parseInt(process.env.NO_DATA_BACKOFF_MS || '300000', 10);
+
+// Helper for AbortSignal-aware sleep
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(resolve, ms);
+        const abortHandler = () => {
+            clearTimeout(timeout);
+            reject(new Error('Aborted'));
+        };
+        signal?.addEventListener('abort', abortHandler, { once: true });
+    });
+}
 
 export function createCrawler(config: CrawlerConfig): CrawlerInstance {
     const POLL_INTERVAL_MS = config.pollIntervalMs || DEFAULT_POLL_INTERVAL;
@@ -28,6 +47,7 @@ export function createCrawler(config: CrawlerConfig): CrawlerInstance {
 
     let isRunning = false;
     let abortController: AbortController | null = null;
+    let storedCountThisRun = 0;
 
     // Here we configure the Playwright crawler to handle the scraping logic
     const crawler = new PlaywrightCrawler({
@@ -40,60 +60,91 @@ export function createCrawler(config: CrawlerConfig): CrawlerInstance {
             config.onStatusChange?.('scraping');
             log.info(`[${config.category}/${config.region}] Processing ${request.url}`);
 
+            // Check for challenge/blocked page
+            const pageTitle = await page.title();
+            const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 1000));
+            
+            const challengeResult = detectChallengePage({
+                url: request.url,
+                title: pageTitle,
+                bodyText,
+            });
+            
+            if (challengeResult.isBlocked) {
+                log.warning(
+                    `[${config.category}/${config.region}] Challenge page detected: ${challengeResult.reasons.join(', ')}`
+                );
+                config.onDataStored?.(0);
+                return;
+            }
+
             try {
                 // Here we wait for the table to load on the page
                 await page.waitForSelector(ROW_SELECTOR, { timeout: 20000 });
             } catch (e) {
                 log.warning(`[${config.category}/${config.region}] Table not found. Page structure may have changed.`);
+                config.onDataStored?.(0);
                 return;
             }
 
-            // Here we extract price data from the table rows
-            const rawData = await page.$$eval(ROW_SELECTOR, (rows: Array<HTMLElement>) => {
-                return rows.map(row => {
+            // Extract raw table data (headers + rows)
+            const rawTableData = await page.evaluate((selector: string) => {
+                // Extract headers from table
+                const headerElements = document.querySelectorAll('th');
+                const headers: string[] = [];
+                headerElements.forEach(th => {
+                    const text = th.textContent?.trim() || '';
+                    if (text) headers.push(text);
+                });
+                
+                // Extract rows
+                const rows = document.querySelectorAll(selector);
+                const extractedRows: any[] = [];
+                
+                rows.forEach(row => {
                     const nameEl = row.querySelector('h4') || row.querySelector('a.font-semibold');
                     const name = nameEl?.textContent?.trim();
+                    
+                    if (!name) return; // Skip rows without names
+                    
+                    // Extract href if available
+                    const linkEl = row.querySelector('a[href]');
+                    const href = linkEl?.getAttribute('href') || undefined;
+                    
+                    // Extract all cell values
+                    const cells = Array.from(row.querySelectorAll('td'));
+                    const cellValues = cells.map(cell => cell.textContent?.trim() || '');
+                    
+                    extractedRows.push({
+                        name,
+                        href,
+                        cells: cellValues,
+                    });
+                });
+                
+                return {
+                    headers,
+                    rows: extractedRows,
+                };
+            }, ROW_SELECTOR);
 
-                    const cells = Array.from(row.querySelectorAll('td')) as Array<HTMLElement>;
-                    const price = cells[3]?.textContent?.trim();
-                    const open = cells[4]?.textContent?.trim();
-                    const high = cells[5]?.textContent?.trim();
-                    const low = cells[6]?.textContent?.trim();
-                    const change = cells[7]?.textContent?.trim();
-                    const changePct = cells[8]?.textContent?.trim();
-
-                    const timeEl = row.querySelector('time');
-                    const time = timeEl?.textContent?.trim();
-
-                    return { name, price, open, high, low, change, changePct, time };
-                }).filter((item: any) => item.name);
-            });
-
-            if (rawData.length === 0) {
+            if (rawTableData.rows.length === 0) {
                 log.warning(`[${config.category}/${config.region}] No data extracted`);
+                storedCountThisRun = 0;
                 return;
             }
 
-            // Here we format the extracted data into our standard record structure
-            const records: Omit<DataRecord, 'id'>[] = rawData.map(item => ({
-                name: item.name || 'Unknown',
-                region: config.region,
-                category: config.category,
-                last: item.price || '',
-                price: item.price,
-                open: item.open,
-                high: item.high,
-                low: item.low,
-                change: item.change,
-                changePct: item.changePct,
-                time: item.time,
-                scrapedAt: new Date().toISOString()
+            // Add IDs to records
+            const recordsWithIds: DataRecord[] = validRecords.map(record => ({
+                id: generateRecordId(record.name, record.region, (record as any).href),
+                ...record,
             }));
 
             // Here we save the records to our Redis store (with JSON fallback)
             const store = await getRedisStore(config.category);
-            await store.push(records);
+            await store.push(recordsWithIds);
 
+            storedCountThisRun = records.length;
             log.info(`[${config.category}/${config.region}] Stored ${records.length} records`);
             config.onDataStored?.(records.length);
         },
@@ -101,14 +152,13 @@ export function createCrawler(config: CrawlerConfig): CrawlerInstance {
         failedRequestHandler({ request }) {
             config.onStatusChange?.('error');
             log.error(`[${config.category}/${config.region}] Request failed: ${request.url}`);
+            storedCountThisRun = 0;
         },
     });
-
-    // Here we track if Playwright succeeded to determine if fallback is needed
-    let playwrightSucceeded = false;
-    const PLAYWRIGHT_TIMEOUT_MS = 30000; // 30 seconds max before falling back
     
     async function runWithRetry(retryCount = 0): Promise<void> {
+        storedCountThisRun = 0; // Reset counter for this run
+        
         try {
             const uniqueKey = `${config.targetUrl}-${Date.now()}`;
             
@@ -123,18 +173,31 @@ export function createCrawler(config: CrawlerConfig): CrawlerInstance {
             });
             
             await Promise.race([crawlerPromise, timeoutPromise]);
-            playwrightSucceeded = true;
+            
+            // Check if Playwright cycle was successful by verifying storedCountThisRun > 0
+            if (storedCountThisRun === 0) {
+                throw new Error('Playwright extracted 0 records - triggering fallback');
+            }
+            
+            log.info(`[${config.category}/${config.region}] Playwright cycle succeeded with ${storedCountThisRun} records`);
         } catch (error) {
-            if (retryCount < MAX_RETRIES) {
+            if (retryCount < MAX_RETRIES && storedCountThisRun === 0) {
                 // Here we calculate the exponential backoff delay
-                const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
+                const delay = RETRY_DELAY_BASE_MS * Math.pow(2, retryCount);
                 log.warning(`[${config.category}/${config.region}] Retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+                
+                try {
+                    await sleep(delay, abortController?.signal);
+                } catch {
+                    // Aborted during sleep
+                    throw new Error('Aborted during retry backoff');
+                }
+                
                 return runWithRetry(retryCount + 1);
             }
             
-            // Here we fall back to Browserless when Playwright exhausts retries
-            log.warning(`[${config.category}/${config.region}] Playwright failed, falling back to Browserless...`);
+            // Here we fall back to Browserless when Playwright exhausts retries or stores 0 records
+            log.warning(`[${config.category}/${config.region}] Playwright failed (stored ${storedCountThisRun} records), falling back to Browserless...`);
             try {
                 const recordCount = await runBrowserlessScrape({
                     category: config.category,
@@ -144,14 +207,25 @@ export function createCrawler(config: CrawlerConfig): CrawlerInstance {
                     onStatusChange: config.onStatusChange,
                     onDataStored: config.onDataStored
                 });
+                
                 if (recordCount > 0) {
                     log.info(`[${config.category}/${config.region}] Browserless fallback succeeded with ${recordCount} records`);
                     return;
                 }
+                
+                // Both Playwright and Browserless returned 0 records
+                log.warning(`[${config.category}/${config.region}] Both Playwright and Browserless returned 0 records. Applying NO_DATA_BACKOFF_MS (${NO_DATA_BACKOFF_MS}ms)`);
+                
+                try {
+                    await sleep(NO_DATA_BACKOFF_MS, abortController?.signal);
+                } catch {
+                    // Aborted during no-data backoff
+                    return;
+                }
             } catch (browserlessError) {
                 log.error(`[${config.category}/${config.region}] Browserless fallback also failed: ${browserlessError}`);
+                throw error;
             }
-            throw error;
         }
     }
 
@@ -177,14 +251,13 @@ export function createCrawler(config: CrawlerConfig): CrawlerInstance {
                 log.error(`[${config.category}/${config.region}] Fatal error: ${error}`);
             }
 
-            // Here we wait for the next scheduled run
-            await new Promise<void>((resolve) => {
-                const timeout = setTimeout(resolve, POLL_INTERVAL_MS);
-                abortController?.signal.addEventListener('abort', () => {
-                    clearTimeout(timeout);
-                    resolve();
-                });
-            });
+            // Here we wait for the next scheduled run with AbortSignal awareness
+            try {
+                await sleep(POLL_INTERVAL_MS, abortController?.signal);
+            } catch {
+                // Aborted, exit the loop
+                break;
+            }
         }
     }
 
